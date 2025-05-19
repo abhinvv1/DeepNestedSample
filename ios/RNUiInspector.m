@@ -8,19 +8,38 @@
 #import "RNUiInspector.h"
 #import <objc/runtime.h>
 
-static const NSInteger MAX_TRAVERSAL_DEPTH = 70;
-static const NSTimeInterval CACHE_DURATION_MS = 300;
+static const NSInteger DEFAULT_MAX_TRAVERSAL_DEPTH = 100; // This is an abs depth limit for the UI tree traversal. The xcui limit is 60.
+static const NSTimeInterval DEFAULT_CACHE_DURATION_MS = 300;
 NSString * const LOG_PREFIX = @"[RNUiInspectorKit] ";
+NSString * const kRNUiInspectorNativeHandleKey = @"nativeHandle"; // Key for the element's unique path.
+
 
 static NSDictionary * _Nullable cachedUiTree = nil;
-static NSTimeInterval lastTreeBuildTime = 0;
-static NSInteger uiElementCounter = 0;
+static NSTimeInterval lastTreeBuildTimeMs = 0;
+static NSInteger uiElementCounterForLastBuild = 0;
 
 @implementation RNUiInspector
 
-#pragma mark - UI Hierarchy Traversal and Property Extraction
+#pragma mark - Configuration Accessors (Optional)
 
-+ (UIWindow *)getKeyWindow {
++ (NSInteger)maxTraversalDepth {
+    // TODO: Make this configurable
+    return DEFAULT_MAX_TRAVERSAL_DEPTH;
+}
+
++ (NSTimeInterval)cacheDurationMs {
+    // TODO: Make this configurable
+    return DEFAULT_CACHE_DURATION_MS;
+}
+
+#pragma mark - UI Hierarchy Traversal & Property Extraction
+
+/**
+ * @brief Gets the key window of the application.
+ * Learn more about key window here: https://reactnative.dev/docs/roottag
+ * @return The key UIWindow object or nil if not found.
+ */
++ (nullable UIWindow *)getKeyWindow {
     if (@available(iOS 13.0, *)) {
         for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
             if (scene.activationState == UISceneActivationStateForegroundActive && [scene isKindOfClass:[UIWindowScene class]]) {
@@ -30,36 +49,54 @@ static NSInteger uiElementCounter = 0;
                         return window;
                     }
                 }
+                // Fallback to the first active window if no explicit key window.
                 if (windowScene.windows.count > 0) {
+                    // Often, the first window is the main one if isKeyWindow isn't set on any.
                     return windowScene.windows.firstObject;
                 }
             }
         }
     }
 
+    // Fallback for older iOS versions or if scenes API doesn't yield a window.
+    // Suggested by the ChatGPT.
     #pragma clang diagnostic push
     #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     UIWindow *keyWindow = UIApplication.sharedApplication.keyWindow;
     if (keyWindow) {
         return keyWindow;
     }
+    // If keyWindow is nil, try the first window in the windows array.
     if (UIApplication.sharedApplication.windows.count > 0) {
         return UIApplication.sharedApplication.windows.firstObject;
     }
     #pragma clang diagnostic pop
     
-    NSLog(@"%@Could not find any window.", LOG_PREFIX);
+    NSLog(@"%@Could not find any suitable window.", LOG_PREFIX);
     return nil;
 }
 
+/**
+ * @brief Finds the RCTRootView starting from a given view.
+ * This helps target the React Native specific part of the hierarchy if present.
+ * @param startView The UIView to begin the search from.
+ * @return The found RCTRootView, or nil if not found.
+ */
 + (nullable UIView *)findRCTRootView:(UIView *)startView {
     if (!startView) return nil;
     Class rctRootViewClass = NSClassFromString(@"RCTRootView");
     if (!rctRootViewClass) {
-        NSLog(@"%@RCTRootView class not found. Assuming non-React Native or hybrid context.", LOG_PREFIX);
+        // This is not an error, just means it's not a standard RN app or RN part isn't loaded.
+        // NSLog(@"%@RCTRootView class not found. Proceeding with standard UIKit traversal.", LOG_PREFIX);
         return nil;
     }
 
+    // Breadth-first search for RCTRootView
+    // Using a queue to traverse the view hierarchy.
+    // This is a simple BFS implementation to find the first RCTRootView.
+    // Using NSMutableArray for queue and NSMutableSet for visited nodes to avoid cycles.
+    // Note: UIView hierarchy is typically acyclic, but this is a safe practice.
+    NSLog(@"%@Starting search for RCTRootView from: %@", LOG_PREFIX, startView.description);
     NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:startView];
     NSMutableSet<NSValue *> *visited = [NSMutableSet set];
 
@@ -76,7 +113,8 @@ static NSInteger uiElementCounter = 0;
             NSLog(@"%@RCTRootView found: %@", LOG_PREFIX, currentView.description);
             return currentView;
         }
-        for (UIView *subview in [currentView.subviews reverseObjectEnumerator]) {
+        // Add subviews to the queue for further searching (typically in reverse for intuitive order if needed, but BFS order is fine here).
+        for (UIView *subview in currentView.subviews) {
             [queue addObject:subview];
         }
     }
@@ -84,54 +122,80 @@ static NSInteger uiElementCounter = 0;
     return nil;
 }
 
-
-+ (NSDictionary *)getPropertiesForView:(UIView *)view {
+/**
+ * @brief Extracts properties from a given UIView.
+ * This is the core method for gathering element metadata.
+ * @param view The UIView to extract properties from.
+ * @return A dictionary of properties.
+ */
++ (NSDictionary<NSString *, id> *)getPropertiesForView:(UIView *)view {
     if (!view) return @{};
 
-    NSMutableDictionary *properties = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString *, id> *properties = [NSMutableDictionary dictionary];
 
     properties[@"type"] = NSStringFromClass(view.class);
     properties[@"testID"] = view.accessibilityIdentifier ?: [NSNull null];
     properties[@"accessibilityLabel"] = view.accessibilityLabel ?: [NSNull null];
     properties[@"accessibilityHint"] = view.accessibilityHint ?: [NSNull null];
     properties[@"accessibilityValue"] = view.accessibilityValue ?: [NSNull null];
-    
-    CGRect frameInWindow = [view.window convertRect:view.frame fromView:view.superview];
-    if (view.window) {
-         frameInWindow = [view convertRect:view.bounds toView:view.window];
-    } else {
-        frameInWindow = view.frame;
-        NSLog(@"%@View %@ is not in a window. Frame coordinates may not be screen-relative.", LOG_PREFIX, view.accessibilityIdentifier ?: NSStringFromClass(view.class));
-    }
+    properties[@"accessibilityTraits"] = @(view.accessibilityTraits);
 
+    // Frame and Center Coordinates (imp: relative to the screen/window)
+    CGRect frameInWindow;
+    CGPoint centerInWindow;
+
+    if (view.window) {
+        // Converts the view's bounds to the coordinate system of its window.
+        // This provides coordinates relative to the window, which are generally what's needed for interactions.
+        frameInWindow = [view convertRect:view.bounds toView:view.window];
+    } else {
+        // If the view is not in a window, it's likely not visible or interactable in the standard sense.
+        // Its 'frame' property is relative to its superview.
+        frameInWindow = view.frame; // Fallback to frame relative to superview. Suggested by ChatGPT.
+        NSLog(@"%@View '%@' (type: %@) is not in a window. 'frame' coordinates are relative to its superview and may not be screen-relative for interaction.",
+              LOG_PREFIX,
+              view.accessibilityIdentifier ?: @"<no-id>",
+              NSStringFromClass(view.class));
+    }
     properties[@"frame"] = @{
         @"x": @(CGRectGetMinX(frameInWindow)),
         @"y": @(CGRectGetMinY(frameInWindow)),
         @"width": @(CGRectGetWidth(frameInWindow)),
         @"height": @(CGRectGetHeight(frameInWindow))
     };
-    properties[@"center"] = @{
-        @"x": @(CGRectGetMidX(frameInWindow)),
-        @"y": @(CGRectGetMidY(frameInWindow))
-    };
-    
+    centerInWindow = CGPointMake(CGRectGetMidX(frameInWindow), CGRectGetMidY(frameInWindow));
+    properties[@"center"] = @{@"x": @(centerInWindow.x), @"y": @(centerInWindow.y)};
+
     properties[@"alpha"] = @(view.alpha);
-    properties[@"hidden"] = @(view.isHidden);
+    properties[@"hidden"] = @(view.isHidden); // Equivalent to UIAccessibilityElement.accessibilityFrame == CGRectZero
     properties[@"userInteractionEnabled"] = @(view.isUserInteractionEnabled);
-    properties[@"tag"] = @(view.tag);
     properties[@"opaque"] = @(view.isOpaque);
     
-    BOOL isOnScreen = view.window && !view.isHidden && view.alpha > 0.01 && CGRectGetWidth(frameInWindow) > 0 && CGRectGetHeight(frameInWindow) > 0;
-    if (isOnScreen && view.window) {
+    BOOL isEffectivelyVisible = view.window && !view.isHidden && view.alpha > 0.01 && CGRectGetWidth(frameInWindow) > 0 && CGRectGetHeight(frameInWindow);
+    if (isEffectivelyVisible) {
+        // Further check if it's within screen bounds (though WDA might handle off-screen taps already)
         CGRect screenBounds = view.window.screen.bounds;
         CGRect intersection = CGRectIntersection(frameInWindow, screenBounds);
-        isOnScreen = !CGRectIsNull(intersection) && !CGRectIsEmpty(intersection);
+        isEffectivelyVisible = !CGRectIsNull(intersection) && !CGRectIsEmpty(intersection);
+        
+        UIView *v = view.superview;
+        while(v && v != view.window) { // Traverse up to the window
+            if (v.isHidden || v.alpha <= 0.01) {
+                isEffectivelyVisible = NO;
+                break;
+            }
+            v = v.superview;
+        }
     }
-    properties[@"onScreen"] = @(isOnScreen);
+    properties[@"isEffectivelyVisible"] = @(isEffectivelyVisible);
+    properties[@"tag"] = @(view.tag);
 
     if ([view respondsToSelector:@selector(text)]) {
-        NSString *text = ((UILabel *)view).text;
+        NSString *text = ((UILabel *)view).text; // Common for UILabel, UITextField, UITextView (though UITextView has its own)
         properties[@"text"] = text ?: [NSNull null];
+    }
+    if ([view isKindOfClass:[UITextView class]]) { // Explicitly for UITextView if 'text' property isn't caught above or is different
+        properties[@"text"] = ((UITextView *)view).text ?: [NSNull null];
     }
     if ([view isKindOfClass:[UITextField class]]) {
         properties[@"placeholder"] = ((UITextField *)view).placeholder ?: [NSNull null];
@@ -151,43 +215,65 @@ static NSInteger uiElementCounter = 0;
     } else if ([view isKindOfClass:[UIStepper class]]) {
         properties[@"value"] = @(((UIStepper *)view).value);
     } else if ([view isKindOfClass:[UISegmentedControl class]]) {
-        properties[@"value"] = @(((UISegmentedControl *)view).selectedSegmentIndex);
+        UISegmentedControl *segmentedControl = (UISegmentedControl *)view;
+        properties[@"value"] = @(segmentedControl.selectedSegmentIndex);
         NSMutableArray *segmentTitles = [NSMutableArray array];
-        for (NSUInteger i = 0; i < ((UISegmentedControl *)view).numberOfSegments; i++) {
-            [segmentTitles addObject:[((UISegmentedControl *)view) titleForSegmentAtIndex:i] ?: @""];
+        for (NSUInteger i = 0; i < segmentedControl.numberOfSegments; i++) {
+            [segmentTitles addObject:[segmentedControl titleForSegmentAtIndex:i] ?: @""];
         }
         properties[@"segmentTitles"] = segmentTitles;
     } else if ([view isKindOfClass:[UIImageView class]]) {
-        properties[@"image"] = ((UIImageView *)view).image ? NSStringFromCGSize(((UIImageView *)view).image.size) : [NSNull null]; // Or a more descriptive string/flag
+        UIImage *image = ((UIImageView *)view).image;
+        properties[@"image"] = image ? [NSString stringWithFormat:@"UIImage (%fx%f)", image.size.width, image.size.height] : [NSNull null];
     }
+    
+    // Add more properties as needed for Appium compatibility, e.g., focused state
+    // We can add more properties here as needed for Appium compatibility.
+    properties[@"isFocused"] = @(view.isFirstResponder);
 
     return [NSDictionary dictionaryWithDictionary:properties];
 }
 
+/**
+ * @brief Recursively traverses the UIView hierarchy to build a dictionary representation.
+ * @param view The current UIView to process.
+ * @param path The nativeHandle path string built so far for this view.
+ * @param depth The current depth in the traversal.
+ * @param parentIsEffectivelyVisible Effective visibility of the parent view.
+ * @return A dictionary representing the element and its children, or nil if max depth exceeded or view is nil.
+ */
 + (nullable NSDictionary *)traverseViewRecursive:(UIView *)view
                                             path:(NSString *)path
                                            depth:(NSInteger)depth
-                                 parentIsVisible:(BOOL)parentIsVisible {
-    if (!view || depth > MAX_TRAVERSAL_DEPTH) {
+                      parentIsEffectivelyVisible:(BOOL)parentIsEffectivelyVisible {
+    if (!view || depth > [self maxTraversalDepth]) {
+        if (depth > [self maxTraversalDepth]) {
+            NSLog(@"%@Max traversal depth (%ld) reached at view: %@, path: %@", LOG_PREFIX, (long)[self maxTraversalDepth], view.accessibilityIdentifier ?: NSStringFromClass(view.class), path);
+        }
         return nil;
     }
-    uiElementCounter++;
+    uiElementCounterForLastBuild++;
 
     NSMutableDictionary *elementInfo = [[self getPropertiesForView:view] mutableCopy];
-    elementInfo[@"nativeHandle"] = path;
+    elementInfo[kRNUiInspectorNativeHandleKey] = path;
     elementInfo[@"depth"] = @(depth);
 
-    BOOL currentElementIsTechnicallyVisible = !view.isHidden && view.alpha > 0.01;
-    BOOL effectivelyVisible = parentIsVisible && currentElementIsTechnicallyVisible;
-    elementInfo[@"effectivelyVisible"] = @(effectivelyVisible);
+    BOOL currentViewIsTechnicallyVisible = ![elementInfo[@"hidden"] boolValue] && [elementInfo[@"alpha"] floatValue] > 0.01;
+    BOOL isCurrentlyEffectivelyVisible = parentIsEffectivelyVisible && currentViewIsTechnicallyVisible;
+    elementInfo[@"isEffectivelyVisible"] = @(isCurrentlyEffectivelyVisible);
 
-
-    NSMutableArray *children = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *children = [NSMutableArray array];
+    // Iterate over subviews in their natural order (important for path indexing)
     NSArray<UIView *> *subviews = view.subviews;
     for (NSUInteger i = 0; i < subviews.count; i++) {
         UIView *subview = subviews[i];
+        // Construct child path: /ParentType[idx]/CurrentType[subviewIndex]
+        // Note: We use NSStringFromClass to get the class name for the path.
         NSString *childPath = [NSString stringWithFormat:@"%@/%@[%lu]", path, NSStringFromClass(subview.class), (unsigned long)i];
-        NSDictionary *childElement = [self traverseViewRecursive:subview path:childPath depth:depth + 1 parentIsVisible:effectivelyVisible];
+        NSDictionary *childElement = [self traverseViewRecursive:subview
+                                                            path:childPath
+                                                           depth:depth + 1
+                                      parentIsEffectivelyVisible:isCurrentlyEffectivelyVisible];
         if (childElement) {
             [children addObject:childElement];
         }
@@ -197,171 +283,222 @@ static NSInteger uiElementCounter = 0;
     return [NSDictionary dictionaryWithDictionary:elementInfo];
 }
 
+#pragma mark - Public API: UI Tree Building
 
-+ (NSDictionary *)buildUiTreeForceRefresh:(BOOL)forceRefresh {
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970] * 1000; // Current time in milliseconds
-    if (!forceRefresh && cachedUiTree && (now - lastTreeBuildTime < CACHE_DURATION_MS)) {
-        NSLog(@"%@Returning cached UI tree.", LOG_PREFIX);
++ (nullable NSDictionary *)buildUiTreeForceRefresh:(BOOL)forceRefresh {
+    NSTimeInterval currentTimeMs = [[NSDate date] timeIntervalSince1970] * 1000;
+    if (!forceRefresh && cachedUiTree && (currentTimeMs - lastTreeBuildTimeMs < [self cacheDurationMs])) {
+        NSLog(@"%@Returning cached UI tree (built %.0fms ago).", LOG_PREFIX, currentTimeMs - lastTreeBuildTimeMs);
         return cachedUiTree;
     }
 
     NSLog(@"%@Building UI tree (forceRefresh: %@)...", LOG_PREFIX, forceRefresh ? @"YES" : @"NO");
-    uiElementCounter = 0;
+    uiElementCounterForLastBuild = 0;
 
     UIWindow *keyWindow = [self getKeyWindow];
     if (!keyWindow) {
         NSLog(@"%@Could not get key window. Aborting tree build.", LOG_PREFIX);
-        cachedUiTree = nil;
+        cachedUiTree = nil; // Invalidate cache on failure, a very important learning from the WDA code.
         return nil;
     }
 
     UIView *rootViewControllerView = keyWindow.rootViewController.view;
     if (!rootViewControllerView) {
         NSLog(@"%@Could not get root view controller's view. Aborting tree build.", LOG_PREFIX);
-        cachedUiTree = nil;
+        cachedUiTree = nil; // Invalidate cache on failure, a very important learning from the WDA code.
         return nil;
     }
 
     UIView *startView = [self findRCTRootView:rootViewControllerView] ?: rootViewControllerView;
-    if (!startView) {
-        NSLog(@"%@No valid start view found. Aborting tree build.", LOG_PREFIX);
-        cachedUiTree = nil;
+    if (!startView) { // Should not happen if rootViewControllerView is valid
+        NSLog(@"%@No valid start view found (should be rootViewControllerView at least). Aborting tree build.", LOG_PREFIX);
+        cachedUiTree = nil; // Invalidate cache on failure, a very important learning from the WDA code.
         return nil;
     }
-    
-    NSString *initialPath = [NSString stringWithFormat:@"/%@", NSStringFromClass(startView.class)];
 
-    cachedUiTree = [self traverseViewRecursive:startView path:initialPath depth:0 parentIsVisible:YES];
+    // The initial path starts with the class name of the actual startView and index 0 (as it's the root of traversal).
+    NSString *initialPath = [NSString stringWithFormat:@"/%@[0]", NSStringFromClass(startView.class)];
 
-    if (cachedUiTree) {
-        lastTreeBuildTime = [[NSDate date] timeIntervalSince1970] * 1000;
-        NSLog(@"%@UI tree built successfully. %ld elements processed. Root type: %@", LOG_PREFIX, (long)uiElementCounter, cachedUiTree[@"type"]);
+    // Start traversal. The root is considered effectively visible initially.
+    NSDictionary *tree = [self traverseViewRecursive:startView path:initialPath depth:0 parentIsEffectivelyVisible:YES];
+
+    if (tree) {
+        cachedUiTree = tree;
+        lastTreeBuildTimeMs = [[NSDate date] timeIntervalSince1970] * 1000;
+        NSLog(@"%@UI tree built successfully. %ld elements processed. Root type: %@", LOG_PREFIX, (long)uiElementCounterForLastBuild, cachedUiTree[@"type"]);
     } else {
+        cachedUiTree = nil; // Invalidate cache on failure, a very important learning from the WDA code.
         NSLog(@"%@Failed to build UI tree.", LOG_PREFIX);
     }
     return cachedUiTree;
 }
 
-#pragma mark - Element Finding and Querying
+#pragma mark - Native UIView Finding (from Path)
 
+/**
+ * @brief Finds a UIView in the live hierarchy using its nativeHandle (path).
+ * This is crucial for getElementMetadataByNativeHandle.
+ * @param path The nativeHandle path of the view to find.
+ * @param rootView The UIView to start searching from (usually the main RCTRootView or window's root view).
+ * @return The found UIView, or nil if not found or path is invalid.
+ */
 + (nullable UIView *)findViewByPath:(NSString *)path inRootView:(UIView *)rootView {
-    if (!path || !rootView || [path isEqualToString:@"/"]) {
-        if ([path isEqualToString:[NSString stringWithFormat:@"/%@", NSStringFromClass(rootView.class)]]) {
-            return rootView;
-        }
+    if (!path || path.length == 0 || !rootView) {
         return nil;
     }
 
+    // Path example: "/RCTRootView[0]/RCTView[1]/CustomText[0]"
     NSArray<NSString *> *components = [path componentsSeparatedByString:@"/"];
     UIView *currentView = rootView;
 
+    // Start from component at index 1 (index 0 is empty due to leading "/")
     for (NSUInteger i = 1; i < components.count; i++) {
         NSString *component = components[i];
-        if (component.length == 0) continue;
+        if (component.length == 0) continue; // Should not happen with valid paths
 
         NSScanner *scanner = [NSScanner scannerWithString:component];
-        NSString *className = nil;
-        NSInteger index = 0;
+        NSString *expectedClassName = nil;
+        NSInteger expectedIndex = -1;
 
-        [scanner scanUpToString:@"[" intoString:&className];
+        [scanner scanUpToString:@"[" intoString:&expectedClassName];
         if (![scanner scanString:@"[" intoString:NULL] ||
-            ![scanner scanInteger:&index] ||
-            ![scanner scanString:@"]" intoString:NULL]) {
-            NSLog(@"%@Invalid path component: %@", LOG_PREFIX, component);
+            ![scanner scanInteger:&expectedIndex] ||
+            ![scanner scanString:@"]" intoString:NULL] ||
+            expectedIndex < 0) {
+            NSLog(@"%@Invalid path component format: '%@' in path '%@'", LOG_PREFIX, component, path);
             return nil;
         }
 
-        if (!currentView || ![NSStringFromClass(currentView.class) isEqualToString:className]) {
-             // This check is tricky if the first component of path is the root view itself.
-             // The loop starts at i=1, so currentView should be the one matching components[i-1].
-             // If i=1, className is from the first path segment. Check if currentView (rootView) matches.
-            if (i == 1 && ![NSStringFromClass(currentView.class) isEqualToString:className]) {
-                 NSLog(@"%@Root view class '%@' does not match path start '%@'", LOG_PREFIX, NSStringFromClass(currentView.class), className);
-                 return nil;
+        // For the very first component (i=1), currentView is the rootView.
+        // Its class must match the first path segment's class.
+        if (i == 1) {
+            if (![NSStringFromClass(currentView.class) isEqualToString:expectedClassName]) {
+                NSLog(@"%@Root view class mismatch. Expected '%@' from path, got '%@'. Path: '%@'", LOG_PREFIX, expectedClassName, NSStringFromClass(currentView.class), path);
+                return nil;
             }
-            // For subsequent components, currentView would have been set to a child in the previous iteration.
-            // This path logic assumes the path always starts with the class name of the actual root traversal view.
+            // The index [0] for the root is implicit in it being the root, no subview lookup yet.
+            // If the path is just "/RootClass[0]", currentView (rootView) is the target.
+            if (components.count == 2) { // Path is just "/RootClass[0]"
+                 return currentView;
+            }
+            continue; // Next component will look into subviews of currentView (rootView)
         }
         
-        if (index < 0 || index >= currentView.subviews.count) {
-            NSLog(@"%@Index %ld out of bounds for subviews of %@ (count: %lu)", LOG_PREFIX, (long)index, NSStringFromClass(currentView.class), (unsigned long)currentView.subviews.count);
+        // For subsequent components (i > 1), currentView is a result of previous iteration.
+        // We need to find its subview at expectedIndex.
+        if (expectedIndex >= currentView.subviews.count) {
+            NSLog(@"%@Path resolution failed: Index %ld out of bounds for subviews of %@ (count: %lu). Path: '%@'", LOG_PREFIX, (long)expectedIndex, NSStringFromClass(currentView.class), (unsigned long)currentView.subviews.count, path);
             return nil; // Index out of bounds
         }
-        
-        UIView *foundChild = nil;
-        NSUInteger currentChildIndex = 0;
-        // We need to find the child that matches both the class name and the index *within that class type* if the path implies that.
-        // However, the current path generation `path/%@[%lu]` uses a simple subview index.
-        // So, we directly use the index
-        if (index < currentView.subviews.count) {
-            UIView *potentialChild = currentView.subviews[index];
-            if ([NSStringFromClass(potentialChild.class) isEqualToString:className]) { // This check is important
-                currentView = potentialChild;
-            } else {
-                 NSLog(@"%@Subview at index %ld is of type '%@', expected '%@' from path component '%@'", LOG_PREFIX, (long)index, NSStringFromClass(potentialChild.class), className, component);
-                 // Try to find the correct Nth child of that specific type if path implies that
-                 // For now, strict path matching based on simple subview index and class.
-                 NSUInteger matchingClassCounter = 0;
-                 BOOL foundMatchingClassAndIndex = NO;
-                 for(UIView *subview in currentView.subviews) {
-                     if ([NSStringFromClass(subview.class) isEqualToString:className]) {
-                         if (matchingClassCounter == index) {
-                             currentView = subview;
-                             foundMatchingClassAndIndex = YES;
-                             break;
-                         }
-                         matchingClassCounter++;
-                     }
-                 }
-                 if (!foundMatchingClassAndIndex) {
-                    NSLog(@"%@Could not find child matching path component: %@", LOG_PREFIX, component);
-                    return nil;
-                 }
-            }
-        } else {
-            NSLog(@"%@Index %ld out of bounds for path component %@", LOG_PREFIX, (long)index, component);
-            return nil;
+
+        UIView *subviewAtIndex = currentView.subviews[expectedIndex];
+        if (![NSStringFromClass(subviewAtIndex.class) isEqualToString:expectedClassName]) {
+            NSLog(@"%@Path resolution failed: Class mismatch at index %ld. Expected '%@', got '%@'. Path: '%@'", LOG_PREFIX, (long)expectedIndex, expectedClassName, NSStringFromClass(subviewAtIndex.class), path);
+            return nil; // Class name mismatch
         }
+        currentView = subviewAtIndex;
     }
     return currentView;
 }
 
+#pragma mark - Public API: Element Metadata & Finding in JSON Tree
 
-+ (nullable NSDictionary *)findElementInNode:(NSDictionary *)node
-                              withIdentifier:(NSString *)identifier
-                                        type:(NSString *)identifierType {
-    if (!node || !identifier || !identifierType) {
++ (nullable NSDictionary *)getElementMetadataByNativeHandle:(NSString *)nativeHandle {
+    if (!nativeHandle || nativeHandle.length == 0) return nil;
+
+    // This operation needs to run on the main thread as it accesses UIKit views.
+    if (![NSThread isMainThread]) {
+        __block NSDictionary *result = nil;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            result = [self getElementMetadataByNativeHandleOnMainThread:nativeHandle];
+        });
+        return result;
+    }
+    return [self getElementMetadataByNativeHandleOnMainThread:nativeHandle];
+}
+
++ (nullable NSDictionary *)getElementMetadataByNativeHandleOnMainThread:(NSString *)nativeHandle {
+    NSLog(@"%@Attempting to get metadata for nativeHandle: %@", LOG_PREFIX, nativeHandle);
+    UIWindow *keyWindow = [self getKeyWindow];
+    if (!keyWindow || !keyWindow.rootViewController.view) {
+        NSLog(@"%@GetMetadata: Could not get key window or root view controller's view.", LOG_PREFIX);
+        return nil;
+    }
+    UIView *traversalRootView = [self findRCTRootView:keyWindow.rootViewController.view] ?: keyWindow.rootViewController.view;
+    if (!traversalRootView) {
+        NSLog(@"%@GetMetadata: Could not determine a root view for traversal.", LOG_PREFIX);
         return nil;
     }
 
-    BOOL match = NO;
-    id nodeValue = node[identifierType];
+    UIView *targetView = [self findViewByPath:nativeHandle inRootView:traversalRootView];
 
-    if ([nodeValue isKindOfClass:[NSString class]] && [nodeValue isEqualToString:identifier]) {
-        match = YES;
-    } else if ([nodeValue respondsToSelector:@selector(isEqualToString:)] && [nodeValue isEqualToString:identifier]) { // For safety
-        match = YES;
+    if (!targetView) {
+        NSLog(@"%@GetMetadata: UIView not found for nativeHandle: %@", LOG_PREFIX, nativeHandle);
+        return nil;
     }
 
-    if (match) {
-        NSMutableDictionary *foundElement = [node mutableCopy];
-        [foundElement removeObjectForKey:@"children"]; // Return flat object
-        return foundElement;
-    }
+    NSMutableDictionary *properties = [[self getPropertiesForView:targetView] mutableCopy];
+    // Ensure the nativeHandle and depth (if known, otherwise -1) are part of the returned metadata.
+    // Depth is tricky here as we are not traversing the JSON tree but the live view.
+    // We can still use the nativeHandle as a unique identifier, but depth is not directly available.
+    // The nativeHandle itself implies the depth. For consistency, we can add it.
+    properties[kRNUiInspectorNativeHandleKey] = nativeHandle;
+    // Depth can be inferred from path components, or set to -1 if direct lookup.
+    properties[@"depth"] = @([nativeHandle componentsSeparatedByString:@"/"].count - 2);
 
-    NSArray *children = node[@"children"];
-    if ([children isKindOfClass:[NSArray class]]) {
-        for (NSDictionary *childNode in children) {
-            if ([childNode isKindOfClass:[NSDictionary class]]) {
-                NSDictionary *found = [self findElementInNode:childNode withIdentifier:identifier type:identifierType];
-                if (found) {
-                    return found;
+    NSLog(@"%@GetMetadata: Successfully retrieved metadata for nativeHandle: %@", LOG_PREFIX, nativeHandle);
+    return [NSDictionary dictionaryWithDictionary:properties];
+}
+
+
++ (nullable NSDictionary *)findNodeInTree:(NSDictionary *)tree byNativeHandle:(NSString *)nativeHandle {
+    if (!tree || !nativeHandle) return nil;
+
+    NSMutableArray<NSDictionary *> *queue = [NSMutableArray arrayWithObject:tree];
+    while (queue.count > 0) {
+        NSDictionary *currentNode = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+
+        if ([currentNode[kRNUiInspectorNativeHandleKey] isEqualToString:nativeHandle]) {
+            NSMutableDictionary *foundNodeCopy = [currentNode mutableCopy];
+            [foundNodeCopy removeObjectForKey:@"children"]; // Return flat structure
+            return foundNodeCopy;
+        }
+
+        NSArray<NSDictionary *> *children = currentNode[@"children"];
+        if ([children isKindOfClass:[NSArray class]]) {
+            for (NSDictionary *child in children) {
+                if ([child isKindOfClass:[NSDictionary class]]) {
+                    [queue addObject:child];
                 }
             }
         }
     }
     return nil;
 }
+
+
++ (nullable NSDictionary *)findElementInNode:(NSDictionary *)node
+                           matchingValue:(NSString *)identifierValue
+                             forKeyPath:(NSString *)identifierKeyPath {
+    if (!node || !identifierValue || !identifierKeyPath) {
+        return nil;
+    }
+
+    NSMutableArray<NSDictionary *> *results = [NSMutableArray array];
+    // Using the more generic findElementsRecursive method.
+    // This allows consistent behavior and future expansion if needed.
+    NSDictionary *criteria = @{identifierKeyPath: identifierValue};
+    
+    // Internal recursive find
+    [self findElementsRecursive:node withCriteria:criteria results:results findAll:NO currentPath:@""];
+
+    if (results.count > 0) {
+        return results.firstObject; // Returns a copy without children
+    }
+    return nil;
+}
+
 
 + (NSArray<NSDictionary *> *)findElementsInNode:(NSDictionary *)node
                                  withCriteria:(NSDictionary<NSString *, id> *)criteria
@@ -370,318 +507,119 @@ static NSInteger uiElementCounter = 0;
     if (!node || !criteria || criteria.count == 0) {
         return results;
     }
-
-    [self findElementsRecursive:node withCriteria:criteria results:results findAll:findAll];
+    
+    // Internal recursive find
+    [self findElementsRecursive:node withCriteria:criteria results:results findAll:findAll currentPath:@""];
     
     return results;
 }
 
+
+/**
+ * @brief Internal recursive helper to find elements matching criteria.
+ * @param currentNode The current JSON node in the tree to inspect.
+ * @param criteria The criteria dictionary. Keys can include operators like ".contains", ".gt".
+ * @param results Accumulator array for matching elements.
+ * @param findAll If YES, find all matches; otherwise, stop after the first.
+ * @param currentPath Internal tracking of path, not strictly needed if nativeHandle is always present.
+ */
 + (void)findElementsRecursive:(NSDictionary *)currentNode
                  withCriteria:(NSDictionary<NSString *, id> *)criteria
                       results:(NSMutableArray<NSDictionary *> *)results
-                    findAll:(BOOL)findAll {
+                    findAll:(BOOL)findAll
+                  currentPath:(NSString *)currentPath { // currentPath is mostly for debugging here
+    
     if (!findAll && results.count > 0) { // Optimization: if only first is needed and already found
         return;
     }
 
     BOOL matchesAllCriteria = YES;
-    for (NSString *key in criteria) {
-        id expectedValue = criteria[key];
-        id actualValue = currentNode[key];
+    for (NSString *criterionKeyWithOperator in criteria) {
+        id expectedValue = criteria[criterionKeyWithOperator];
+        
+        NSArray<NSString *> *keyParts = [criterionKeyWithOperator componentsSeparatedByString:@"."];
+        NSString *actualKey = keyParts[0];
+        NSString *operator = keyParts.count > 1 ? keyParts.lastObject : @"eq"; // Default operator is equals
+        
+        // Handle nested keys like "frame.width"
+        id actualValue = currentNode;
+        for (NSUInteger i = 0; i < keyParts.count - (keyParts.count > 1 ? 1:0) ; ++i) {
+            NSString *pathSegment = keyParts[i];
+            if ([actualValue isKindOfClass:[NSDictionary class]] && ((NSDictionary*)actualValue)[pathSegment]) {
+                actualValue = ((NSDictionary*)actualValue)[pathSegment];
+            } else {
+                actualValue = nil; // Path doesn't exist in current node
+                break;
+            }
+        }
 
-        if ([actualValue isEqual:[NSNull null]]) actualValue = nil;
+        if ([actualValue isEqual:[NSNull null]]) actualValue = nil; // Treat NSNull as nil for comparisons
 
-        if (!actualValue && expectedValue) {
+        // If actualValue is nil but we expect a value (and it's not NSNull itself), it's a mismatch.
+        if (!actualValue && expectedValue && ![expectedValue isEqual:[NSNull null]]) {
             matchesAllCriteria = NO;
             break;
         }
-        if (actualValue && !expectedValue) {
-            if (![expectedValue isEqual:[NSNull null]]) {
-                 matchesAllCriteria = NO;
-                 break;
-            }
+        // If actualValue exists but we expect nil/NSNull, it's a mismatch (unless actualValue is also nil already).
+        if (actualValue && !expectedValue && ![expectedValue isEqual:[NSNull null]]) {
+             matchesAllCriteria = NO;
+             break;
         }
-        
-        if (actualValue && expectedValue && ![expectedValue isEqual:[NSNull null]]) {
-             if ([expectedValue isKindOfClass:[NSString class]] && [actualValue isKindOfClass:[NSString class]]) {
-                if (![actualValue isEqualToString:expectedValue]) {
-                    matchesAllCriteria = NO;
-                    break;
-                }
-            } else if ([expectedValue isKindOfClass:[NSNumber class]] && [actualValue isKindOfClass:[NSNumber class]]) {
-                if (![actualValue isEqualToNumber:expectedValue]) {
-                    matchesAllCriteria = NO;
-                    break;
-                }
-            } else if (![actualValue isEqual:expectedValue]) {
-                matchesAllCriteria = NO;
-                break;
-            }
+        // If both are nil or NSNull, it's a match for this criterion.
+        if ((!actualValue || [actualValue isEqual:[NSNull null]]) && [expectedValue isEqual:[NSNull null]]) {
+            continue;
         }
+        // If expectedValue is nil but actual is not, it's a mismatch.
+        if (!expectedValue && actualValue) {
+            matchesAllCriteria = NO;
+            break;
+        }
+
+
+        // Perform comparison based on operator
+        if ([operator isEqualToString:@"eq"]) {
+            if (![actualValue isEqual:expectedValue]) matchesAllCriteria = NO;
+        } else if ([operator isEqualToString:@"neq"]) {
+            if ([actualValue isEqual:expectedValue]) matchesAllCriteria = NO;
+        } else if ([operator isEqualToString:@"contains"]) {
+            if (!([actualValue isKindOfClass:[NSString class]] && [expectedValue isKindOfClass:[NSString class]] && [(NSString *)actualValue containsString:(NSString *)expectedValue])) matchesAllCriteria = NO;
+        } else if ([operator isEqualToString:@"startsWith"]) {
+            if (!([actualValue isKindOfClass:[NSString class]] && [expectedValue isKindOfClass:[NSString class]] && [(NSString *)actualValue hasPrefix:(NSString *)expectedValue])) matchesAllCriteria = NO;
+        } else if ([operator isEqualToString:@"endsWith"]) {
+            if (!([actualValue isKindOfClass:[NSString class]] && [expectedValue isKindOfClass:[NSString class]] && [(NSString *)actualValue hasSuffix:(NSString *)expectedValue])) matchesAllCriteria = NO;
+        } else if ([actualValue isKindOfClass:[NSNumber class]] && [expectedValue isKindOfClass:[NSNumber class]]) {
+            // Numeric comparisons
+            NSComparisonResult compResult = [(NSNumber *)actualValue compare:(NSNumber *)expectedValue];
+            if ([operator isEqualToString:@"gt"]) { if (compResult != NSOrderedDescending) matchesAllCriteria = NO; }
+            else if ([operator isEqualToString:@"gte"]) { if (compResult == NSOrderedAscending) matchesAllCriteria = NO; }
+            else if ([operator isEqualToString:@"lt"]) { if (compResult != NSOrderedAscending) matchesAllCriteria = NO; }
+            else if ([operator isEqualToString:@"lte"]) { if (compResult == NSOrderedDescending) matchesAllCriteria = NO; }
+            else if (![actualValue isEqualToNumber:expectedValue]) { matchesAllCriteria = NO;} // Fallback for "eq" on numbers
+        } else if (![actualValue isEqual:expectedValue]) { // Default non-numeric, non-operator equality check
+            matchesAllCriteria = NO;
+        }
+
+        if (!matchesAllCriteria) break; // One criterion failed
     }
 
     if (matchesAllCriteria) {
-        NSMutableDictionary *foundElement = [currentNode mutableCopy];
-        [foundElement removeObjectForKey:@"children"];
-        [results addObject:foundElement];
-        if (!findAll) return;
+        NSMutableDictionary *foundElementCopy = [currentNode mutableCopy];
+        [foundElementCopy removeObjectForKey:@"children"]; // Return flat structure
+        [results addObject:foundElementCopy];
+        if (!findAll) return; // Found first, and that's all we need
     }
 
-    NSArray *children = currentNode[@"children"];
+    // Recursively search children
+    NSArray<NSDictionary *> *children = currentNode[@"children"];
     if ([children isKindOfClass:[NSArray class]]) {
         for (NSDictionary *childNode in children) {
             if ([childNode isKindOfClass:[NSDictionary class]]) {
-                [self findElementsRecursive:childNode withCriteria:criteria results:results findAll:findAll];
-                if (!findAll && results.count > 0) break;
+                // The child's path is already in childNode[kRNUiInspectorNativeHandleKey]
+                [self findElementsRecursive:childNode withCriteria:criteria results:results findAll:findAll currentPath:childNode[kRNUiInspectorNativeHandleKey]];
+                if (!findAll && results.count > 0) break; // Optimization
             }
         }
     }
 }
-
-
-#pragma mark - Action Execution
-
-+ (NSDictionary *)performNativeAction:(RNInspectorActionType)actionType
-                        onElementPath:(NSString *)elementPath
-                       withParameters:(nullable NSDictionary *)parameters {
-    if (![NSThread isMainThread]) {
-        __block NSDictionary *result;
-        dispatch_sync(dispatch_get_main_queue(), ^{
-            result = [self performNativeActionOnMainThread:actionType onElementPath:elementPath withParameters:parameters];
-        });
-        return result;
-    }
-    return [self performNativeActionOnMainThread:actionType onElementPath:elementPath withParameters:parameters];
-}
-
-+ (NSDictionary *)performNativeActionOnMainThread:(RNInspectorActionType)actionType
-                                    onElementPath:(NSString *)elementPath
-                                   withParameters:(nullable NSDictionary *)parameters {
-    NSLog(@"%@Attempting action %ld on path: %@", LOG_PREFIX, (long)actionType, elementPath);
-
-    UIWindow *keyWindow = [self getKeyWindow];
-    if (!keyWindow || !keyWindow.rootViewController.view) {
-        return @{@"status": @"error", @"message": @"Could not get key window or root view."};
-    }
-    
-    UIView *rctRootView = [self findRCTRootView:keyWindow.rootViewController.view] ?: keyWindow.rootViewController.view;
-    if (!rctRootView) {
-         return @{@"status": @"error", @"message": @"Could not find a suitable root view for path resolution."};
-    }
-
-    UIView *targetView = [self findViewByPath:elementPath inRootView:rctRootView];
-
-    if (!targetView) {
-        NSString *message = [NSString stringWithFormat:@"Element not found for path: %@", elementPath];
-        NSLog(@"%@%@", LOG_PREFIX, message);
-        return @{@"status": @"error", @"message": message};
-    }
-
-    BOOL isEffectivelyVisible = !targetView.isHidden && targetView.alpha > 0.01 && targetView.window;
-    if (targetView.superview) {
-        UIView *v = targetView.superview;
-        while(v && v != targetView.window) {
-            if (v.isHidden || v.alpha <= 0.01) {
-                isEffectivelyVisible = NO;
-                break;
-            }
-            v = v.superview;
-        }
-    }
-    
-    if (!isEffectivelyVisible) {
-         NSString *message = [NSString stringWithFormat:@"Element at path %@ is not effectively visible for interaction.", elementPath];
-         NSLog(@"%@%@", LOG_PREFIX, message);
-         return @{@"status": @"error", @"message": message};
-    }
-    if (!targetView.isUserInteractionEnabled &&
-        (actionType == RNInspectorActionTypeTap || actionType == RNInspectorActionTypeLongPress || actionType == RNInspectorActionTypeSetText)) {
-        NSString *message = [NSString stringWithFormat:@"Element at path %@ has userInteractionEnabled=NO.", elementPath];
-        NSLog(@"%@%@", LOG_PREFIX, message);
-        return @{@"status": @"error", @"message": message};
-    }
-    if ([targetView isKindOfClass:[UIControl class]] && !((UIControl *)targetView).isEnabled &&
-        (actionType == RNInspectorActionTypeTap || actionType == RNInspectorActionTypeLongPress || actionType == RNInspectorActionTypeSetText)) {
-         NSString *message = [NSString stringWithFormat:@"Control at path %@ is not enabled.", elementPath];
-         NSLog(@"%@%@", LOG_PREFIX, message);
-         return @{@"status": @"error", @"message": message};
-    }
-
-
-    switch (actionType) {
-        case RNInspectorActionTypeTap: {
-            if ([targetView respondsToSelector:@selector(accessibilityActivate)]) {
-                if ([targetView accessibilityActivate]) {
-                     NSLog(@"%@Tap (accessibilityActivate) successful on: %@", LOG_PREFIX, elementPath);
-                    return @{@"status": @"success", @"message": @"Tap performed via accessibilityActivate."};
-                }
-            }
-            if ([targetView isKindOfClass:[UIControl class]]) {
-                UIControl *control = (UIControl *)targetView;
-                // Check if the control is enabled
-                if (!control.isEnabled) {
-                    return @{@"status": @"error", @"message": @"Control is not enabled."};
-                }
-                [control sendActionsForControlEvents:UIControlEventTouchUpInside];
-                 NSLog(@"%@Tap (sendActionsForControlEvents) successful on: %@", LOG_PREFIX, elementPath);
-                return @{@"status": @"success", @"message": @"Tap performed via sendActionsForControlEvents."};
-            }
-            NSLog(@"%@Tap action not fully supported for generic UIView type: %@. Tried accessibilityActivate.", LOG_PREFIX, NSStringFromClass(targetView.class));
-            return @{@"status": @"error", @"message": @"Tap action not fully supported for this element type. Try making it a UIControl or ensure accessibilityActivate works."};
-        }
-            
-        case RNInspectorActionTypeLongPress: {
-            // Simulating a true long press programmatically without XCTest framework is tricky.
-            // We can try to send touch events with delays, but this is not standard.
-            // For UIControls, there isn't a standard "long press" event.
-            // Often, long press is handled by UILongPressGestureRecognizer.
-            // We could try to find and trigger such a recognizer if attached.
-            
-            // Simple approach: If it's a button, maybe just tap it as a fallback.
-            // Or, if a gesture recognizer is found:
-            for (UIGestureRecognizer *recognizer in targetView.gestureRecognizers) {
-                if ([recognizer isKindOfClass:[UILongPressGestureRecognizer class]]) {
-                    // This is tricky because setting state and calling handler is not public API.
-                    // ((UILongPressGestureRecognizer *)recognizer).state = UIGestureRecognizerStateBegan;
-                    // then UIGestureRecognizerStateEnded after a delay.
-                    // This is highly unreliable and uses private-like behavior.
-                    NSLog(@"%@Found UILongPressGestureRecognizer on %@. Programmatic triggering is complex/unreliable.", LOG_PREFIX, elementPath);
-                    break;
-                }
-            }
-            NSLog(@"%@Long press action is complex to simulate reliably without XCUITest. No standard programmatic trigger.", LOG_PREFIX);
-            return @{@"status": @"error", @"message": @"Long press action not reliably implemented yet."};
-        }
-
-        case RNInspectorActionTypeSetText: {
-            NSString *textToSet = parameters[@"text"];
-            if (!textToSet || ![textToSet isKindOfClass:[NSString class]]) {
-                return @{@"status": @"error", @"message": @"'text' parameter (string) is required for setText action."};
-            }
-            if ([targetView isKindOfClass:[UITextField class]]) {
-                ((UITextField *)targetView).text = textToSet;
-                [[NSNotificationCenter defaultCenter] postNotificationName:UITextFieldTextDidChangeNotification object:targetView];
-                NSLog(@"%@SetText successful on UITextField: %@", LOG_PREFIX, elementPath);
-                return @{@"status": @"success", @"message": @"Text set on UITextField."};
-            } else if ([targetView isKindOfClass:[UITextView class]]) {
-                ((UITextView *)targetView).text = textToSet;
-                [[NSNotificationCenter defaultCenter] postNotificationName:UITextViewTextDidChangeNotification object:targetView];
-                 NSLog(@"%@SetText successful on UITextView: %@", LOG_PREFIX, elementPath);
-                return @{@"status": @"success", @"message": @"Text set on UITextView."};
-            } else if ([targetView respondsToSelector:@selector(setText:)]) {
-                #pragma clang diagnostic push
-                #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                [targetView performSelector:@selector(setText:) withObject:textToSet];
-                #pragma clang diagnostic pop
-                NSLog(@"%@SetText (generic setText:) attempted on: %@", LOG_PREFIX, elementPath);
-                return @{@"status": @"success", @"message": @"Text set via generic setText: (may not trigger all updates)." };
-            }
-            NSLog(@"%@SetText action not supported for element type: %@", LOG_PREFIX, NSStringFromClass(targetView.class));
-            return @{@"status": @"error", @"message": @"Element does not support setText action."};
-        }
-            
-        case RNInspectorActionTypeClearText: {
-             if ([targetView isKindOfClass:[UITextField class]]) {
-                ((UITextField *)targetView).text = @"";
-                [[NSNotificationCenter defaultCenter] postNotificationName:UITextFieldTextDidChangeNotification object:targetView];
-                NSLog(@"%@ClearText successful on UITextField: %@", LOG_PREFIX, elementPath);
-                return @{@"status": @"success", @"message": @"Text cleared on UITextField."};
-            } else if ([targetView isKindOfClass:[UITextView class]]) {
-                ((UITextView *)targetView).text = @"";
-                [[NSNotificationCenter defaultCenter] postNotificationName:UITextViewTextDidChangeNotification object:targetView];
-                NSLog(@"%@ClearText successful on UITextView: %@", LOG_PREFIX, elementPath);
-                return @{@"status": @"success", @"message": @"Text cleared on UITextView."};
-            } else if ([targetView respondsToSelector:@selector(setText:)]) {
-                #pragma clang diagnostic push
-                #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                [targetView performSelector:@selector(setText:) withObject:@""];
-                #pragma clang diagnostic pop
-                NSLog(@"%@ClearText (generic setText:) attempted on: %@", LOG_PREFIX, elementPath);
-                return @{@"status": @"success", @"message": @"Text cleared via generic setText: (may not trigger all updates)."};
-            }
-            NSLog(@"%@ClearText action not supported for element type: %@", LOG_PREFIX, NSStringFromClass(targetView.class));
-            return @{@"status": @"error", @"message": @"Element does not support clearText action."};
-        }
-            
-        case RNInspectorActionTypeScrollToVisible: {
-            UIScrollView *scrollView = nil;
-            UIView *viewToScroll = targetView;
-
-            UIView *ancestor = targetView.superview;
-            while (ancestor) {
-                if ([ancestor isKindOfClass:[UIScrollView class]]) {
-                    scrollView = (UIScrollView *)ancestor;
-                    break;
-                }
-                ancestor = ancestor.superview;
-            }
-
-            if (scrollView) {
-                CGRect targetFrameInScrollView = [scrollView convertRect:targetView.bounds fromView:targetView];
-                CGRect visibleRectInScrollView = CGRectMake(scrollView.contentOffset.x, scrollView.contentOffset.y,
-                                                            scrollView.bounds.size.width, scrollView.bounds.size.height);
-                if (CGRectContainsRect(visibleRectInScrollView, targetFrameInScrollView)) {
-                     NSLog(@"%@Element %@ already visible in scroll view.", LOG_PREFIX, elementPath);
-                    return @{@"status": @"success", @"message": @"Element already visible in scroll view."};
-                }
-
-                [scrollView scrollRectToVisible:targetFrameInScrollView animated:YES];
-                NSLog(@"%@ScrollToVisible attempted for: %@ within scrollview %@", LOG_PREFIX, elementPath, scrollView);
-                return @{@"status": @"success", @"message": @"ScrollToVisible action initiated."};
-            }
-            NSLog(@"%@ScrollToVisible: No UIScrollView found as ancestor of %@", LOG_PREFIX, elementPath);
-            return @{@"status": @"error", @"message": @"No scroll view found to perform scroll."};
-        }
-
-        default:
-             NSLog(@"%@Unknown action type: %ld", LOG_PREFIX, (long)actionType);
-            return @{@"status": @"error", @"message": @"Unknown action type."};
-    }
-}
-
-
-#pragma mark - Element Metadata Retrieval
-
-+ (nullable NSDictionary *)getElementMetadataByPath:(NSString *)elementPath {
-    if (![NSThread isMainThread]) {
-        __block NSDictionary *result;
-        dispatch_sync(dispatch_get_main_queue(), ^{
-            result = [self getElementMetadataByPathOnMainThread:elementPath];
-        });
-        return result;
-    }
-    return [self getElementMetadataByPathOnMainThread:elementPath];
-}
-
-+ (nullable NSDictionary *)getElementMetadataByPathOnMainThread:(NSString *)elementPath {
-    NSLog(@"%@Getting metadata for path: %@", LOG_PREFIX, elementPath);
-    UIWindow *keyWindow = [self getKeyWindow];
-    if (!keyWindow || !keyWindow.rootViewController.view) {
-        NSLog(@"%@GetMetadata: Could not get key window or root view.", LOG_PREFIX);
-        return nil;
-    }
-    
-    UIView *rctRootView = [self findRCTRootView:keyWindow.rootViewController.view] ?: keyWindow.rootViewController.view;
-     if (!rctRootView) {
-        NSLog(@"%@GetMetadata: Could not find a suitable root view for path resolution.", LOG_PREFIX);
-        return nil;
-    }
-
-    UIView *targetView = [self findViewByPath:elementPath inRootView:rctRootView];
-
-    if (!targetView) {
-        NSLog(@"%@GetMetadata: Element not found for path: %@", LOG_PREFIX, elementPath);
-        return nil;
-    }
-
-    NSDictionary *properties = [self getPropertiesForView:targetView];
-    NSMutableDictionary *elementInfo = [properties mutableCopy];
-    elementInfo[@"nativeHandle"] = elementPath;
-    elementInfo[@"depth"] = @(-1);
-    
-    NSLog(@"%@GetMetadata: Successfully retrieved metadata for %@", LOG_PREFIX, elementPath);
-    return [NSDictionary dictionaryWithDictionary:elementInfo];
-}
-
 
 @end
