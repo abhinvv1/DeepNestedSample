@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { View, Text, StyleSheet, ScrollView, SafeAreaView, Button } from 'react-native';
+import React, {useState} from 'react';
+import {View, Text, StyleSheet, ScrollView, SafeAreaView, Button, TextInput} from 'react-native'; // Added TextInput
 
 const MAX_WIDTH_PER_NODE = 1;
 const EXTRA_WRAPPERS_PER_RENDER_LEVEL = 2;
@@ -7,18 +7,18 @@ const EXTRA_WRAPPERS_PER_RENDER_LEVEL = 2;
 const App = () => {
   const [logicalComplexity, setLogicalComplexity] = useState(50);
   const [pressCount, setPressCount] = useState(0);
+  const [inputValue, setInputValue] = useState("Initial Text");
 
   const handleDeepButtonPress = (path: string) => {
     setPressCount(prev => prev + 1);
     console.log(`Deep button pressed: ${path}, Total Presses: ${pressCount + 1}`);
   };
 
-  // Generates a "skinny" and deep data structure
-  const generateComplexStructure = (currentLogicalComplexity: number) => {
-    const createNestedObject = (currentDataDepth: number, parentPath: string = ''): object | null => {
+  const generateComplexStructure = (currentLogicalComplexity) => {
+    const createNestedObject = (currentDataDepth, parentPath = '') => {
       if (currentDataDepth <= 0) return null;
 
-      const obj: { [key: string]: any } = {};
+      const obj = {};
       const currentGeneratedDataLevel = currentLogicalComplexity - currentDataDepth + 1;
       const childIndex = 0;
       const newPath = parentPath ? `${parentPath}-${childIndex}` : `${childIndex}`;
@@ -44,10 +44,10 @@ const App = () => {
           children: []
         };
         if (currentDataDepth - 1 > 0) {
-            const deeperChildNodeMap = createNestedObject(currentDataDepth - 1, newPath);
-            if (deeperChildNodeMap) {
-              obj[childKey].children.push(deeperChildNodeMap);
-            }
+          const deeperChildNodeMap = createNestedObject(currentDataDepth - 1, newPath);
+          if (deeperChildNodeMap) {
+            obj[childKey].children.push(deeperChildNodeMap);
+          }
         }
       } else {
         obj[childKey] = {
@@ -56,7 +56,7 @@ const App = () => {
           children: [],
           level: currentGeneratedDataLevel,
           testID: `generic-view-${uniqueIDSuffix}`,
-          metadata: { index: childIndex, path: newPath, level: currentGeneratedDataLevel, nestedInfo: { details: { moreNesting: { evenMore: { deepValue: `metadata-${newPath}`}}}} },
+          metadata: {index: childIndex, path: newPath, level: currentGeneratedDataLevel, nestedInfo: {details: {moreNesting: {evenMore: {deepValue: `metadata-${newPath}`}}}}},
         };
         const deeperChildNodeMap = createNestedObject(currentDataDepth - 1, newPath);
         if (deeperChildNodeMap) {
@@ -71,7 +71,7 @@ const App = () => {
   const renderComplexData = (data: any, currentContentRenderLevel = 1): JSX.Element[] | null => {
     if (!data || typeof data !== 'object') return null;
 
-    const components: JSX.Element[] = [];
+    const components = [];
 
     Object.keys(data).forEach(key => {
       const item = data[key];
@@ -81,14 +81,14 @@ const App = () => {
       const logicalDataLevel = item.level || 1;
       const baseTestID = item.testID || `generic-${logicalDataLevel}-${itemPath}`;
 
-      let contentChildren: JSX.Element[] | null = null;
+      let contentChildren = null;
       if (item.children && item.children.length > 0) {
-        contentChildren = item.children.flatMap((childData: any) =>
+        contentChildren = item.children.flatMap((childData) =>
           renderComplexData(childData, currentContentRenderLevel + EXTRA_WRAPPERS_PER_RENDER_LEVEL + 1) || []
         );
       }
 
-      let contentComponentCore: JSX.Element | null = null;
+      let contentComponentCore = null;
       const contentWrapperStyle = [
         styles.box,
         {
@@ -174,10 +174,8 @@ const App = () => {
               accessibilityLabel={`Extra Wrapper ${i} for ${itemPath} at actual render level ${actualWrapperRenderLevel}`}
               accessibilityHint={`Hint for Extra Wrapper ${i}, render level ${actualWrapperRenderLevel}`}
               style={{
-                // padding: 0.75,
-                // margin: 0.75,
                 borderWidth: 1,
-                borderColor: `rgba(0,0,${100 + (actualWrapperRenderLevel % 155)}, ${0.2 + (actualWrapperRenderLevel % 8) * 0.1})`, // Thanks to ChatGPT for this color logic
+                borderColor: `rgba(0,0,${100 + (actualWrapperRenderLevel % 155)}, ${0.2 + (actualWrapperRenderLevel % 8) * 0.1})`,
               }}
             >
               {wrappedComponent}
@@ -191,7 +189,6 @@ const App = () => {
   };
 
   const complexData = generateComplexStructure(logicalComplexity);
-  const effectiveMaxRenderDepth = logicalComplexity * (1 + EXTRA_WRAPPERS_PER_RENDER_LEVEL);
 
   return (
     <SafeAreaView style={styles.container}>
@@ -201,6 +198,21 @@ const App = () => {
           Presses: {pressCount}
         </Text>
       </View>
+
+      {/* Add TextInput here */}
+      <View style={styles.inputContainer}>
+        <Text style={styles.inputLabel}>Editable Text Input:</Text>
+        <TextInput
+          style={styles.textInput}
+          value={inputValue}
+          onChangeText={setInputValue} // Makes it a controlled component
+          placeholder="Enter text here..."
+          testID="my-text-input" // Crucial for locating it
+          accessibilityLabel="My Editable Text Input"
+        />
+        <Text style={styles.infoTextSmall}>Current Value: {inputValue}</Text>
+      </View>
+
 
       <Text style={styles.infoText}>
         {`Each logical level's content is wrapped by ${EXTRA_WRAPPERS_PER_RENDER_LEVEL} unique, non-collapsible Views.`}
@@ -238,6 +250,33 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginTop: 5,
   },
+  // Styles for TextInput
+  inputContainer: {
+    padding: 10,
+    backgroundColor: '#E8EAF6',
+    borderBottomWidth: 1,
+    borderBottomColor: '#C5CAE9',
+  },
+  inputLabel: {
+    fontSize: 14,
+    color: '#3F51B5',
+    marginBottom: 5,
+  },
+  textInput: {
+    height: 40,
+    borderColor: '#7986CB',
+    borderWidth: 1,
+    paddingHorizontal: 10,
+    borderRadius: 4,
+    backgroundColor: 'white',
+    fontSize: 15,
+  },
+  infoTextSmall: {
+    fontSize: 10,
+    color: '#546E7A',
+    marginTop: 4,
+  },
+  // --- End TextInput Styles ---
   controls: {
     alignItems: 'center',
     paddingVertical: 10,

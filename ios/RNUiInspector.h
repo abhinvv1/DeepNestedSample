@@ -10,6 +10,11 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+typedef NS_ENUM(NSInteger, RNInspectorActionType) {
+    RNInspectorActionTypeSetText,
+    RNInspectorActionTypeClearText
+};
+
 extern NSString * const kRNUiInspectorNativeHandleKey;
 
 @interface RNUiInspector : NSObject
@@ -81,6 +86,22 @@ extern NSString * const kRNUiInspectorNativeHandleKey;
 + (NSArray<NSDictionary *> *)findElementsInNode:(NSDictionary *)node
                                  withCriteria:(NSDictionary<NSString *, id> *)criteria
                                     findAll:(BOOL)findAll;
+
+/**
+ * @brief Performs a native action on a UI element identified by its path.
+ *
+ * This method sends a command to the native side to perform a specific action
+ * on a UI element, such as tapping or entering text.
+ *
+ * @param actionType The type of action to perform.
+ * @param elementPath The path-like identifier of the element to act upon.
+ * @param parameters Optional parameters for the action (e.g., text to set).
+ * @return A dictionary containing the result of the action, or an error message.
+ */
++ (NSDictionary *)performNativeAction:(RNInspectorActionType)actionType
+                        onElementPath:(NSString *)elementPath
+                       withParameters:(nullable NSDictionary *)parameters;
+
 
 @end
 

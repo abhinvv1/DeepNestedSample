@@ -622,4 +622,156 @@ static NSInteger uiElementCounterForLastBuild = 0;
     }
 }
 
+#pragma mark - Action Execution
+
++ (NSDictionary *)performNativeAction:(RNInspectorActionType)actionType
+                        onElementPath:(NSString *)elementPath
+                       withParameters:(nullable NSDictionary *)parameters {
+    // Ensure UI operations are on the main thread.
+    if (![NSThread isMainThread]) {
+        __block NSDictionary *result;
+        // Use dispatch_sync to wait for the result from the main thread.
+        // Be cautious with dispatch_sync if this method itself could be called from the main thread
+        // in a way that leads to deadlock, though for server request handling, it's usually fine.
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            result = [self performNativeActionOnMainThread:actionType
+                                             onElementPath:elementPath
+                                            withParameters:parameters];
+        });
+        return result;
+    }
+    // Already on the main thread, execute directly. Thanks to ChatGPT for this suggestion.
+    return [self performNativeActionOnMainThread:actionType
+                                   onElementPath:elementPath
+                                  withParameters:parameters];
+}
+
++ (NSDictionary *)performNativeActionOnMainThread:(RNInspectorActionType)actionType
+                                    onElementPath:(NSString *)elementPath
+                                   withParameters:(nullable NSDictionary *)parameters {
+    NSAssert([NSThread isMainThread], @"performNativeActionOnMainThread must be called on the main thread.");
+
+    NSLog(@"%@Attempting action %ld on path: %@", LOG_PREFIX, (long)actionType, elementPath);
+
+    UIWindow *keyWindow = [self getKeyWindow];
+    if (!keyWindow || !keyWindow.rootViewController || !keyWindow.rootViewController.view) {
+        return @{@"status": @"error", @"message": @"Could not get key window or root view controller's view for action."};
+    }
+    UIView *traversalRootView = [self findRCTRootView:keyWindow.rootViewController.view] ?: keyWindow.rootViewController.view; // Assuming findRCTRootView is implemented
+    if (!traversalRootView) {
+        return @{@"status": @"error", @"message": @"Could not determine a root view for path resolution for action."};
+    }
+
+    UIView *targetView = [self findViewByPath:elementPath inRootView:traversalRootView];
+
+    if (!targetView) {
+        NSString *message = [NSString stringWithFormat:@"Element not found for path: %@. Cannot perform action.", elementPath];
+        NSLog(@"%@%@", LOG_PREFIX, message);
+        return @{@"status": @"error", @"message": message};
+    }
+
+    // Check effective visibility and interaction enabled state.
+    // (Using properties directly from the live view here)
+    BOOL isEffectivelyVisible = NO;
+    if (targetView.window && !targetView.isHidden && targetView.alpha > 0.01) {
+        isEffectivelyVisible = YES;
+        UIView *v = targetView.superview;
+        while(v && v != targetView.window) {
+            if (v.isHidden || v.alpha <= 0.01) {
+                isEffectivelyVisible = NO;
+                break;
+            }
+            v = v.superview;
+        }
+    }
+
+    if (!isEffectivelyVisible) {
+         NSString *message = [NSString stringWithFormat:@"Element at path %@ is not effectively visible. Cannot perform action.", elementPath];
+         NSLog(@"%@%@", LOG_PREFIX, message);
+         return @{@"status": @"error", @"message": message};
+    }
+
+    // For actions that require interaction (like setText, clearText, tap)
+    if (actionType == RNInspectorActionTypeSetText || actionType == RNInspectorActionTypeClearText /* || actionType == RNInspectorActionTypeTap */ ) {
+        if (!targetView.isUserInteractionEnabled) {
+            NSString *message = [NSString stringWithFormat:@"Element at path %@ has userInteractionEnabled=NO. Cannot perform action.", elementPath];
+            NSLog(@"%@%@", LOG_PREFIX, message);
+            return @{@"status": @"error", @"message": message};
+        }
+        if ([targetView isKindOfClass:[UIControl class]] && !((UIControl *)targetView).isEnabled) {
+             NSString *message = [NSString stringWithFormat:@"Control at path %@ is not enabled. Cannot perform action.", elementPath];
+             NSLog(@"%@%@", LOG_PREFIX, message);
+             return @{@"status": @"error", @"message": message};
+        }
+    }
+
+
+    switch (actionType) {
+        case RNInspectorActionTypeSetText: {
+            NSString *textToSet = parameters[@"text"];
+            if (!textToSet || ![textToSet isKindOfClass:[NSString class]]) {
+                return @{@"status": @"error", @"message": @"'parameters.text' (string) is required for setText action."};
+            }
+
+            if ([targetView isKindOfClass:[UITextField class]]) {
+                UITextField *textField = (UITextField *)targetView;
+                textField.text = textToSet;
+                [[NSNotificationCenter defaultCenter] postNotificationName:UITextFieldTextDidChangeNotification object:textField];
+                NSLog(@"%@SetText successful on UITextField: %@", LOG_PREFIX, elementPath);
+                return @{@"status": @"success", @"message": @"Text set on UITextField."};
+            } else if ([targetView isKindOfClass:[UITextView class]]) {
+                UITextView *textView = (UITextView *)targetView;
+                textView.text = textToSet;
+                [[NSNotificationCenter defaultCenter] postNotificationName:UITextViewTextDidChangeNotification object:textView];
+                NSLog(@"%@SetText successful on UITextView: %@", LOG_PREFIX, elementPath);
+                return @{@"status": @"success", @"message": @"Text set on UITextView."};
+            } else if ([targetView respondsToSelector:@selector(setText:)]) {
+                #pragma clang diagnostic push
+                #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                [targetView performSelector:@selector(setText:) withObject:textToSet];
+                #pragma clang diagnostic pop
+                NSLog(@"%@SetText (generic setText:) attempted on: %@. Note: Standard notifications may not have been posted.", LOG_PREFIX, elementPath);
+                return @{@"status": @"success", @"message": @"Text set via generic setText: (standard notifications might not be posted)." };
+            } else {
+                NSString *message = [NSString stringWithFormat:@"Element at path %@ (type: %@) does not support setText action.", elementPath, NSStringFromClass(targetView.class)];
+                NSLog(@"%@%@", LOG_PREFIX, message);
+                return @{@"status": @"error", @"message": message};
+            }
+        }
+            
+        case RNInspectorActionTypeClearText: {
+             if ([targetView isKindOfClass:[UITextField class]]) {
+                UITextField *textField = (UITextField *)targetView;
+                textField.text = @"";
+                [[NSNotificationCenter defaultCenter] postNotificationName:UITextFieldTextDidChangeNotification object:textField];
+                NSLog(@"%@ClearText successful on UITextField: %@", LOG_PREFIX, elementPath);
+                return @{@"status": @"success", @"message": @"Text cleared on UITextField."};
+            } else if ([targetView isKindOfClass:[UITextView class]]) {
+                UITextView *textView = (UITextView *)targetView;
+                textView.text = @"";
+                [[NSNotificationCenter defaultCenter] postNotificationName:UITextViewTextDidChangeNotification object:textView];
+                NSLog(@"%@ClearText successful on UITextView: %@", LOG_PREFIX, elementPath);
+                return @{@"status": @"success", @"message": @"Text cleared on UITextView."};
+            } else if ([targetView respondsToSelector:@selector(setText:)]) {
+                // Generic fallback
+                #pragma clang diagnostic push
+                #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                [targetView performSelector:@selector(setText:) withObject:@""];
+                #pragma clang diagnostic pop
+                NSLog(@"%@ClearText (generic setText:) attempted on: %@. Note: Standard notifications may not have been posted.", LOG_PREFIX, elementPath);
+                return @{@"status": @"success", @"message": @"Text cleared via generic setText: (standard notifications might not be posted)."};
+            } else {
+                NSString *message = [NSString stringWithFormat:@"Element at path %@ (type: %@) does not support clearText action.", elementPath, NSStringFromClass(targetView.class)];
+                NSLog(@"%@%@", LOG_PREFIX, message);
+                return @{@"status": @"error", @"message": message};
+            }
+        }
+        // case RNInspectorActionTypeTap: {}
+
+        default:
+             NSLog(@"%@Unknown or unsupported action type: %ld for path %@", LOG_PREFIX, (long)actionType, elementPath);
+            return @{@"status": @"error", @"message": [NSString stringWithFormat:@"Unknown or unsupported action type: %ld", (long)actionType]};
+    }
+}
+
 @end

@@ -61,6 +61,98 @@ extern NSString * const kRNUiInspectorNativeHandleKey;
     return self.webServer.isRunning;
 }
 
+- (GCDWebServerAsyncProcessBlock)actionHandlerBlock {
+    return ^(__kindof GCDWebServerDataRequest * _Nonnull request, GCDWebServerCompletionBlock  _Nonnull completionBlock) {
+        NSDictionary *jsonBody = request.jsonObject;
+        if (![jsonBody isKindOfClass:[NSDictionary class]]) {
+             GCDWebServerDataResponse *response = [GCDWebServerDataResponse responseWithJSONObject:@{@"status":@"error", @"message":@"Invalid JSON body."}];
+            [response setStatusCode:400];
+            completionBlock(response);
+            return;
+        }
+
+        NSString *nativeHandle = jsonBody[kRNUiInspectorNativeHandleKey];
+        NSString *actionName = jsonBody[@"action"];
+        NSDictionary *actionParams = jsonBody[@"parameters"];
+
+        if (!nativeHandle || ![nativeHandle isKindOfClass:[NSString class]] || nativeHandle.length == 0) {
+            GCDWebServerDataResponse *response = [GCDWebServerDataResponse responseWithJSONObject:@{@"status":@"error", @"message":[NSString stringWithFormat:@"'%@' (string) is required in JSON body.", kRNUiInspectorNativeHandleKey]}];
+            [response setStatusCode:400];
+            completionBlock(response);
+            return;
+        }
+        if (!actionName || ![actionName isKindOfClass:[NSString class]] || actionName.length == 0) {
+            GCDWebServerDataResponse *response = [GCDWebServerDataResponse responseWithJSONObject:@{@"status":@"error", @"message":@"'action' (string) is required in JSON body."}];
+            [response setStatusCode:400];
+            completionBlock(response);
+            return;
+        }
+        if (actionParams && ![actionParams isKindOfClass:[NSDictionary class]]) {
+            GCDWebServerDataResponse *response = [GCDWebServerDataResponse responseWithJSONObject:@{@"status":@"error", @"message":@"'parameters' must be an object if provided."}];
+            [response setStatusCode:400];
+            completionBlock(response);
+            return;
+        }
+
+        RNInspectorActionType actionType;
+        BOOL actionRecognized = YES;
+
+        if ([actionName isEqualToString:@"setText"]) {
+            actionType = RNInspectorActionTypeSetText;
+            if (!actionParams || !actionParams[@"text"] || ![actionParams[@"text"] isKindOfClass:[NSString class]]) {
+                 GCDWebServerDataResponse *response = [GCDWebServerDataResponse responseWithJSONObject:@{@"status":@"error", @"message":@"'parameters.text' (string) is required for 'setText' action."}];
+                [response setStatusCode:400];
+                completionBlock(response);
+                return;
+            }
+        } else if ([actionName isEqualToString:@"clearText"]) {
+            actionType = RNInspectorActionTypeClearText;
+        }
+        // else if ([actionName isEqualToString:@"tap"]) {
+        //     actionType = RNInspectorActionTypeTap;
+        // }
+        else {
+            actionRecognized = NO;
+        }
+
+        if (!actionRecognized) {
+            GCDWebServerDataResponse *response = [GCDWebServerDataResponse responseWithJSONObject:@{@"status":@"error", @"message":[NSString stringWithFormat:@"Unsupported action: %@", actionName]}];
+            [response setStatusCode:400];
+            completionBlock(response);
+            return;
+        }
+
+        // RNUiInspector's performNativeAction handles dispatching to the main thread if needed.
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            NSDictionary *actionResult = [RNUiInspector performNativeAction:actionType
+                                                               onElementPath:nativeHandle
+                                                              withParameters:actionParams];
+
+            GCDWebServerDataResponse *response = [GCDWebServerDataResponse responseWithJSONObject:actionResult];
+            
+            if (![actionResult[@"status"] isEqualToString:@"success"]) {
+                NSString *message = actionResult[@"message"] ?: @"Unknown error during action.";
+                if ([message containsString:@"not found"]) {
+                    [response setStatusCode:404];
+                } else if ([message containsString:@"not enabled"] ||
+                           [message containsString:@"not effectively visible"] ||
+                           [message containsString:@"userInteractionEnabled=NO"]) {
+                    [response setStatusCode:409];
+                } else if ([message containsString:@"not supported for this element type"] ||
+                           [message containsString:@"does not support"]) {
+                    [response setStatusCode:405];
+                }
+                else {
+                    [response setStatusCode:500];
+                }
+            } else {
+                [response setStatusCode:200];
+            }
+            completionBlock(response);
+        });
+    };
+}
+
 - (void)setupRoutes {
     [_webServer addHandlerForMethod:@"GET"
                                path:@"/ping"
@@ -98,7 +190,7 @@ extern NSString * const kRNUiInspectorNativeHandleKey;
 
     [_webServer addHandlerForMethod:@"POST"
                                path:@"/query"
-                       requestClass:[GCDWebServerDataRequest class] // Expect JSON body
+                       requestClass:[GCDWebServerDataRequest class]
                   asyncProcessBlock:^(__kindof GCDWebServerDataRequest * _Nonnull request, GCDWebServerCompletionBlock  _Nonnull completionBlock) {
         
         NSDictionary *requestBody = request.jsonObject;
@@ -207,6 +299,11 @@ extern NSString * const kRNUiInspectorNativeHandleKey;
         }
     }];
 
+    [_webServer addHandlerForMethod:@"POST"
+                               path:@"/action"
+                       requestClass:[GCDWebServerDataRequest class]
+                  asyncProcessBlock:[self actionHandlerBlock]];
+
     [_webServer addDefaultHandlerForMethod:@"OPTIONS"
                               requestClass:[GCDWebServerRequest class]
                               processBlock:^GCDWebServerResponse * _Nullable(__kindof GCDWebServerRequest * _Nonnull request) {
@@ -240,6 +337,7 @@ extern NSString * const kRNUiInspectorNativeHandleKey;
         NSLog(@"%@  GET  /tree?forceRefresh=<true|false>", LOG_PREFIX);
         NSLog(@"%@  GET  /element?nativeHandle=<handle> OR testID=<id>&forceRefresh=<bool> OR accessibilityLabel=<label>&forceRefresh=<bool>", LOG_PREFIX);
         NSLog(@"%@  POST /query?forceRefresh=<true|false> (JSON: {\"criteria\":{...}, \"findAll\":true, \"nativeHandle\":\"optional_root_path\"})", LOG_PREFIX);
+        NSLog(@"%@  POST /action (JSON: {\"nativeHandle\":\"...\", \"action\":\"actionName\", \"parameters\":{...}})", LOG_PREFIX);
     } else {
         NSLog(@"%@Error starting RNInspectorKit server: %@", LOG_PREFIX, error.localizedDescription);
         if (error.code == EADDRINUSE) {
